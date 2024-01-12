@@ -12,7 +12,7 @@ class Profiler():
     event_tid = {"counter": 1, "external": 2, "internal": 3}
 
     def __init__(self):
-        self.enabled = os.getenv("TGI_PROFILER_ENABLED", "false").lower() == "true"
+        self.enabled = os.getenv("TGI_PROFILER_ENABLED", "false").lower() == "true" and int(os.getenv("RANK", "0")) == 0
         if self.enabled:
             with open("server_events.json", "w") as outfile:
                 outfile.write('{"traceEvents": ')
