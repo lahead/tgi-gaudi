@@ -7,6 +7,7 @@ from grpc_interceptor.server import AsyncServerInterceptor
 from loguru import logger
 from typing import Callable, Any
 import traceback
+import os
 
 
 class ExceptionInterceptor(AsyncServerInterceptor):
