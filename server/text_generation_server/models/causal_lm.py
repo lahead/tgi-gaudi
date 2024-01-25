@@ -14,7 +14,7 @@ from typing import Optional, Tuple, List, Type, Dict
 from habana_frameworks.torch.hpu import wrap_in_hpu_graph
 import habana_frameworks.torch as htorch
 from contextlib import nullcontext
-from optimum.habana.utils import HabanaProfile, to_gb_rounded
+from optimum.habana.utils import to_gb_rounded
 
 from optimum.habana.transformers.generation import MODELS_OPTIMIZED_WITH_STATIC_SHAPES
 from optimum.habana.checkpoint_utils import (
@@ -200,10 +200,10 @@ class CausalLMBatch(Batch):
     # prev_next_token_ids = torch.zeros((1), device="hpu", dtype=torch.int64)
     # prev_next_token_logprobs = torch.zeros((1), device="hpu", dtype=torch.float32)
     # prev_logprobs = torch.zeros((1, 32000), device="hpu", dtype=torch.float32)
-    prev_next_token_ids = None
-    prev_next_token_logprobs = None
-    prev_logprobs = None
-    prev_past = None
+    # prev_next_token_ids = None
+    # prev_next_token_logprobs = None
+    # prev_logprobs = None
+    prev_logits = None
 
 
     def to_pb(self) -> generate_pb2.CachedBatch:
@@ -492,6 +492,78 @@ class CausalLMBatch(Batch):
             yield i
 
 
+class HabanaProfile(object):
+    """
+    HPU profiler only could be run once, so HABANA_PROFILE_ENABLED, a class static variable shared by all the instances of HabanaProfile, is used to control which part will be captured.
+    """
+
+    HABANA_PROFILE_ENABLED = True
+
+    def __init__(
+        self,
+        warmup: int = 0,
+        active: int = 0,
+        record_shapes: bool = True,
+        output_dir: str = "./hpu_profile",
+        wait: int = 0,
+    ):
+        if active <= 0 or not HabanaProfile.HABANA_PROFILE_ENABLED:
+
+            def noop():
+                pass
+
+            self.start = noop
+            self.stop = noop
+            self.step = noop
+        else:
+            HabanaProfile.HABANA_PROFILE_ENABLED = False
+            schedule = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1)
+            activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]
+
+            profiler = torch.profiler.profile(
+                schedule=schedule,
+                activities=activities,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+                record_shapes=record_shapes,
+                with_stack=False,
+            )
+            self.start = profiler.start
+            self.stop = profiler.stop
+            self.step = profiler.step
+            HabanaProfile.enable.invalid = True
+            HabanaProfile.disable.invalid = True
+
+    def stop(self):
+        self.stop()
+
+    def start(self):
+        self.start()
+
+    def step(self):
+        self.step()
+
+    @staticmethod
+    def disable():
+        """
+        Runs only once and must happen before doing profiling.
+        """
+        if hasattr(HabanaProfile.disable, "invalid"):
+            if not HabanaProfile.disable.invalid:
+                HabanaProfile.HABANA_PROFILE_ENABLED = False
+        else:
+            HabanaProfile.HABANA_PROFILE_ENABLED = False
+
+    @staticmethod
+    def enable():
+        """
+        Runs only once and must happen before doing profiling.
+        """
+        if hasattr(HabanaProfile.enable, "invalid"):
+            if not HabanaProfile.enable.invalid:
+                HabanaProfile.HABANA_PROFILE_ENABLED = True
+        else:
+            HabanaProfile.HABANA_PROFILE_ENABLED = True
+
 class CausalLM(Model):
     def __init__(
         self,
@@ -691,31 +763,27 @@ class CausalLM(Model):
             #           {batches[0].prev_next_token_logprobs.shape} {batches[1].prev_next_token_logprobs.shape}\n \
             #               {batches[0].prev_logprobs.shape} {batches[1].prev_logprobs.shape}", file=file)
 
-            if batches[0].prev_next_token_ids is not None and batches[1].prev_next_token_ids is not None:
-                new_prev_next_token_ids = torch.cat((batches[0].prev_next_token_ids, batches[1].prev_next_token_ids))
-                new_prev_next_token_logprobs = torch.cat((batches[0].prev_next_token_logprobs, batches[1].prev_next_token_logprobs))
-                new_prev_logprobs = torch.cat((batches[0].prev_logprobs, batches[1].prev_logprobs))
-
-                new_prev_next_token_ids = torch.nn.functional.pad(new_prev_next_token_ids, pad=[0, BATCH_BUCKET_SIZE- new_prev_next_token_ids.size(0)])
-                new_prev_next_token_logprobs = torch.nn.functional.pad(new_prev_next_token_logprobs, pad=[0, BATCH_BUCKET_SIZE- new_prev_next_token_logprobs.size(0)])
-                new_prev_logprobs = torch.nn.functional.pad(new_prev_logprobs, pad=[0, 0, 0, BATCH_BUCKET_SIZE- new_prev_logprobs.size(0)])
+            assert batches[0].prev_logits is not None and batches[1].prev_logits is not None, "decode prev state batches missing"
+            if batches[0].prev_logits is not None and batches[1].prev_logits is not None:
+                new_prev_logits = torch.cat((batches[0].prev_logits, batches[1].prev_logits))
+                new_prev_logits = torch.nn.functional.pad(new_prev_logits, pad=[0, 0, 0, 0, 0, BATCH_BUCKET_SIZE - new_prev_logits.size(0)])
             else:
-                new_prev_next_token_ids = None
-                new_prev_next_token_logprobs = None
-                new_prev_logprobs = None
+                new_prev_logits = None
 
             batch = self.batch_type.concatenate(batches, self.tokenizer.pad_token_id)
 
-            batch.prev_next_token_ids = new_prev_next_token_ids
-            batch.prev_next_token_logprobs = new_prev_next_token_logprobs
-            batch.prev_logprobs = new_prev_logprobs
+            batch.prev_logits = new_prev_logits
         else:
             batch = batches[0]
 
         prefill = batch.past_key_values is None
         # Check if we need to do any bookkeeping first
         if not prefill:
+            assert batch.prev_logits is not None, "no prefill but missing state prior to recombine"
+            new_prev_logits = batch.prev_logits
             batch = batch.__class__.recombine([batch], self.tokenizer.pad_token_id)
+            batch.prev_logits = new_prev_logits
+            assert batch.prev_logits is not None, "no prefill but missing state post to recombine"
 
         scenario = 'PREFILL' if prefill else 'GENERATE'
         dbg_trace(
@@ -730,8 +798,10 @@ class CausalLM(Model):
             if prefill:
                 # no right padding for prefill
                 token_idx = torch.tensor(batch.attention_mask.shape[-1] - 1).to(self.device)
+                token_idx_cpu = torch.tensor(batch.attention_mask.shape[-1] - 1, device="cpu")
             else:
                 token_idx = torch.tensor(batch.attention_mask.shape[-1] - batch.right_padding).to(self.device)
+                token_idx_cpu = torch.tensor(batch.attention_mask.shape[-1] - batch.right_padding, device="cpu")
             attention_mask = batch.attention_mask
         else:
             token_idx = None
@@ -744,24 +814,31 @@ class CausalLM(Model):
         else:
             input_ids = batch.input_ids
 
-        if prefill:
-            logits, past = self.forward(
-                input_ids,
-                attention_mask,
-                batch.position_ids,
-                token_idx,
-                batch.past_key_values,
-                bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
-            )
-        else:
-            logits = self.forward(
-                input_ids,
-                attention_mask,
-                batch.position_ids,
-                token_idx,
-                batch.past_key_values,
-                bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
-            )
+        if batch.prev_logits is None:
+            assert prefill, "prev state missing but not prefill"
+            batch.prev_logits = torch.zeros([1,1,32000], dtype=torch.float32, device="hpu")
+
+            # batch.prev_next_token_ids = next_token_ids
+            # batch.prev_next_token_logprobs = next_token_logprobs
+            # batch.prev_logprobs = logprobs
+
+            # if self.hb_profer_started == True:
+            #     self.hb_profer.step()
+            # htorch.core.mark_step()
+
+            # return generations, batch
+        # else:
+        #     assert batch.prev_next_token_ids.shape == next_token_ids.shape, f"prev_next_token_ids wrong shape {batch.prev_next_token_ids.shape} {next_token_ids.shape}"
+        #     assert batch.prev_next_token_logprobs.shape == next_token_logprobs.shape, f"prev_next_token_logprobs wrong shape {batch.prev_next_token_logprobs.shape} {next_token_logprobs.shape}"
+        #     assert batch.prev_logprobs.shape == logprobs.shape, f"prev_logprobs wrong shape {batch.prev_logprobs.shape} {logprobs.shape}"
+
+        #prev_logits = batch.prev_logits
+
+        # batch.prev_next_token_ids = next_token_ids
+        # batch.prev_next_token_logprobs = next_token_logprobs
+        # batch.prev_logprobs = logprobs
+
+        logits = batch.prev_logits
 
         # Results
         generations: List[Generation] = []
@@ -778,52 +855,34 @@ class CausalLM(Model):
                 batch.input_ids[:, :token_idx], logits.squeeze(-2)
             )
 
-        if batch.prev_next_token_ids is None:
-            batch.prev_next_token_ids = torch.zeros_like(next_token_ids)
-            batch.prev_next_token_logprobs = torch.zeros_like(next_token_logprobs)
-            batch.prev_logprobs = torch.zeros_like(logprobs)
-
-            # batch.prev_next_token_ids = next_token_ids
-            # batch.prev_next_token_logprobs = next_token_logprobs
-            # batch.prev_logprobs = logprobs
-
-            # if self.hb_profer_started == True:
-            #     self.hb_profer.step()
-            # htorch.core.mark_step()
-
-            # return generations, batch
-        else:
-            assert batch.prev_next_token_ids.shape == next_token_ids.shape, f"prev_next_token_ids wrong shape {batch.prev_next_token_ids.shape} {next_token_ids.shape}"
-            assert batch.prev_next_token_logprobs.shape == next_token_logprobs.shape, f"prev_next_token_logprobs wrong shape {batch.prev_next_token_logprobs.shape} {next_token_logprobs.shape}"
-            assert batch.prev_logprobs.shape == logprobs.shape, f"prev_logprobs wrong shape {batch.prev_logprobs.shape} {logprobs.shape}"
-
-        prev_next_token_ids = batch.prev_next_token_ids
-        prev_next_token_logprobs = batch.prev_next_token_logprobs
-        prev_logprobs = batch.prev_logprobs
-
-        batch.prev_next_token_ids = next_token_ids
-        batch.prev_next_token_logprobs = next_token_logprobs
-        batch.prev_logprobs = logprobs
-
-        next_token_ids = prev_next_token_ids
-        next_token_logprobs = prev_next_token_logprobs
-        logprobs = prev_logprobs
-
         batch_top_token_ids, batch_top_token_logprobs = batch_top_tokens(
             batch.top_n_tokens,
             batch.top_n_tokens_tensor,
             logprobs,
         )
-        # if prefill:
-        #     with open('output.txt', 'a') as file:
-        #         print(f"shapes {len(past)}", file=file)
-        #         for p in past:
-        #             print(f"p {len(p)}", file=file)
-        #             for t in p:
-        #                 print(f"p {t.shape}", file=file)
 
         next_token_logprobs = next_token_logprobs.tolist()
         next_token_ids_cpu = next_token_ids.cpu()
+        htorch.core.mark_step()
+
+        if prefill:
+            batch.prev_logits, past = self.forward(
+                input_ids,
+                attention_mask,
+                batch.position_ids,
+                token_idx,
+                batch.past_key_values,
+                bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
+            )
+        else:
+            batch.prev_logits = self.forward(
+                input_ids,
+                attention_mask,
+                batch.position_ids,
+                token_idx,
+                batch.past_key_values,
+                bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
+            )
         htorch.core.mark_step()
 
         for req_idx, req in enumerate(batch.requests):
@@ -932,7 +991,7 @@ class CausalLM(Model):
         if token_idx is None:
             batch.input_ids[:, 0] = next_token_ids[:, 0]
         else:
-            batch.input_ids.index_copy_(1, token_idx.cpu(), next_token_ids.unsqueeze(1))
+            batch.input_ids.index_copy_(1, token_idx_cpu, next_token_ids.unsqueeze(1))
 
         # We finished all generations in the batch; there is no next batch
         if stopped:
