@@ -197,6 +197,15 @@ class CausalLMBatch(Batch):
     input_length: int
     right_padding: int
 
+    # prev_next_token_ids = torch.zeros((1), device="hpu", dtype=torch.int64)
+    # prev_next_token_logprobs = torch.zeros((1), device="hpu", dtype=torch.float32)
+    # prev_logprobs = torch.zeros((1, 32000), device="hpu", dtype=torch.float32)
+    prev_next_token_ids = None
+    prev_next_token_logprobs = None
+    prev_logprobs = None
+    prev_past = None
+
+
     def to_pb(self) -> generate_pb2.CachedBatch:
         return generate_pb2.CachedBatch(
             id=self.batch_id,
@@ -673,7 +682,36 @@ class CausalLM(Model):
             return outputs.logits, outputs.past_key_values
 
     @tracer.start_as_current_span("generate_token")
-    def generate_token(self, batch: CausalLMBatch) -> Tuple[List[Generation], Optional[CausalLMBatch]]:
+    def generate_token(self, batches: List[CausalLMBatch]) -> Tuple[List[Generation], Optional[CausalLMBatch]]:
+        if len(batches) > 1:
+            assert len(batches) == 2
+
+            # with open('output.txt', 'a') as file:
+            #     print(f"concating \n{batches[0].prev_next_token_ids.shape} {batches[1].prev_next_token_ids.shape}\n \
+            #           {batches[0].prev_next_token_logprobs.shape} {batches[1].prev_next_token_logprobs.shape}\n \
+            #               {batches[0].prev_logprobs.shape} {batches[1].prev_logprobs.shape}", file=file)
+
+            if batches[0].prev_next_token_ids is not None and batches[1].prev_next_token_ids is not None:
+                new_prev_next_token_ids = torch.cat((batches[0].prev_next_token_ids, batches[1].prev_next_token_ids))
+                new_prev_next_token_logprobs = torch.cat((batches[0].prev_next_token_logprobs, batches[1].prev_next_token_logprobs))
+                new_prev_logprobs = torch.cat((batches[0].prev_logprobs, batches[1].prev_logprobs))
+
+                new_prev_next_token_ids = torch.nn.functional.pad(new_prev_next_token_ids, pad=[0, BATCH_BUCKET_SIZE- new_prev_next_token_ids.size(0)])
+                new_prev_next_token_logprobs = torch.nn.functional.pad(new_prev_next_token_logprobs, pad=[0, BATCH_BUCKET_SIZE- new_prev_next_token_logprobs.size(0)])
+                new_prev_logprobs = torch.nn.functional.pad(new_prev_logprobs, pad=[0, 0, 0, BATCH_BUCKET_SIZE- new_prev_logprobs.size(0)])
+            else:
+                new_prev_next_token_ids = None
+                new_prev_next_token_logprobs = None
+                new_prev_logprobs = None
+
+            batch = self.batch_type.concatenate(batches, self.tokenizer.pad_token_id)
+
+            batch.prev_next_token_ids = new_prev_next_token_ids
+            batch.prev_next_token_logprobs = new_prev_next_token_logprobs
+            batch.prev_logprobs = new_prev_logprobs
+        else:
+            batch = batches[0]
+
         prefill = batch.past_key_values is None
         # Check if we need to do any bookkeeping first
         if not prefill:
@@ -740,11 +778,49 @@ class CausalLM(Model):
                 batch.input_ids[:, :token_idx], logits.squeeze(-2)
             )
 
+        if batch.prev_next_token_ids is None:
+            batch.prev_next_token_ids = torch.zeros_like(next_token_ids)
+            batch.prev_next_token_logprobs = torch.zeros_like(next_token_logprobs)
+            batch.prev_logprobs = torch.zeros_like(logprobs)
+
+            # batch.prev_next_token_ids = next_token_ids
+            # batch.prev_next_token_logprobs = next_token_logprobs
+            # batch.prev_logprobs = logprobs
+
+            # if self.hb_profer_started == True:
+            #     self.hb_profer.step()
+            # htorch.core.mark_step()
+
+            # return generations, batch
+        else:
+            assert batch.prev_next_token_ids.shape == next_token_ids.shape, f"prev_next_token_ids wrong shape {batch.prev_next_token_ids.shape} {next_token_ids.shape}"
+            assert batch.prev_next_token_logprobs.shape == next_token_logprobs.shape, f"prev_next_token_logprobs wrong shape {batch.prev_next_token_logprobs.shape} {next_token_logprobs.shape}"
+            assert batch.prev_logprobs.shape == logprobs.shape, f"prev_logprobs wrong shape {batch.prev_logprobs.shape} {logprobs.shape}"
+
+        prev_next_token_ids = batch.prev_next_token_ids
+        prev_next_token_logprobs = batch.prev_next_token_logprobs
+        prev_logprobs = batch.prev_logprobs
+
+        batch.prev_next_token_ids = next_token_ids
+        batch.prev_next_token_logprobs = next_token_logprobs
+        batch.prev_logprobs = logprobs
+
+        next_token_ids = prev_next_token_ids
+        next_token_logprobs = prev_next_token_logprobs
+        logprobs = prev_logprobs
+
         batch_top_token_ids, batch_top_token_logprobs = batch_top_tokens(
             batch.top_n_tokens,
             batch.top_n_tokens_tensor,
             logprobs,
         )
+        # if prefill:
+        #     with open('output.txt', 'a') as file:
+        #         print(f"shapes {len(past)}", file=file)
+        #         for p in past:
+        #             print(f"p {len(p)}", file=file)
+        #             for t in p:
+        #                 print(f"p {t.shape}", file=file)
 
         next_token_logprobs = next_token_logprobs.tolist()
         next_token_ids_cpu = next_token_ids.cpu()
