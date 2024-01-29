@@ -847,6 +847,8 @@ class CausalLM(Model):
         # batch.prev_next_token_logprobs = next_token_logprobs
         # batch.prev_logprobs = logprobs
 
+
+
         logits = prev_logits
 
         # Results
@@ -870,10 +872,7 @@ class CausalLM(Model):
             logprobs,
         )
 
-        next_token_logprobs = next_token_logprobs.tolist()
-        next_token_ids_cpu = next_token_ids.cpu()
         htorch.core.mark_step()
-
         if prefill:
             new_logits, past = self.forward(
                 input_ids,
@@ -893,6 +892,11 @@ class CausalLM(Model):
                 bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
             )
         htorch.core.mark_step()
+
+        next_token_logprobs = next_token_logprobs.tolist()
+        next_token_ids_cpu = next_token_ids.cpu()
+        htorch.core.mark_step()
+
 
         for req_idx, req in enumerate(batch.requests):
             i = req.idx
