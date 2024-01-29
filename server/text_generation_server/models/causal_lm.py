@@ -203,7 +203,7 @@ class CausalLMBatch(Batch):
     # prev_next_token_ids = None
     # prev_next_token_logprobs = None
     # prev_logprobs = None
-    prev_logits = None
+    #prev_logits = None
 
 
     def to_pb(self) -> generate_pb2.CachedBatch:
@@ -595,7 +595,6 @@ class CausalLM(Model):
         rank = int(os.getenv("RANK", "0"))
         self.enable_hpu_graph = os.getenv("ENABLE_HPU_GRAPH", "true").lower() == "true"
         self.limit_hpu_graph = os.getenv("LIMIT_HPU_GRAPH", "false").lower() == "true"
-
         if world_size > 1:
             import habana_frameworks.torch.hpu as torch_hpu
 
@@ -702,6 +701,8 @@ class CausalLM(Model):
             self.hb_profer_started = False
         self.step = 0
 
+        self.prev_logits = None
+
     @property
     def batch_type(self) -> Type[CausalLMBatch]:
         return CausalLMBatch
@@ -763,27 +764,35 @@ class CausalLM(Model):
             #           {batches[0].prev_next_token_logprobs.shape} {batches[1].prev_next_token_logprobs.shape}\n \
             #               {batches[0].prev_logprobs.shape} {batches[1].prev_logprobs.shape}", file=file)
 
-            assert batches[0].prev_logits is not None and batches[1].prev_logits is not None, "decode prev state batches missing"
-            if batches[0].prev_logits is not None and batches[1].prev_logits is not None:
-                new_prev_logits = torch.cat((batches[0].prev_logits, batches[1].prev_logits))
-                new_prev_logits = torch.nn.functional.pad(new_prev_logits, pad=[0, 0, 0, 0, 0, BATCH_BUCKET_SIZE - new_prev_logits.size(0)])
-            else:
-                new_prev_logits = None
+            # assert batches[0].prev_logits is not None and batches[1].prev_logits is not None, "decode prev state batches missing"
+
+            # if batches[0].prev_logits is not None and batches[1].prev_logits is not None:
+            #     new_prev_logits = torch.cat((batches[0].prev_logits, batches[1].prev_logits))
+            #     new_prev_logits = torch.nn.functional.pad(new_prev_logits, pad=[0, 0, 0, 0, 0, BATCH_BUCKET_SIZE - new_prev_logits.size(0)])
+            # else:
+            #     new_prev_logits = None
 
             batch = self.batch_type.concatenate(batches, self.tokenizer.pad_token_id)
 
-            batch.prev_logits = new_prev_logits
+            # batch.prev_logits = new_prev_logits
         else:
             batch = batches[0]
 
         prefill = batch.past_key_values is None
+        if prefill:
+            prev_logits = torch.zeros([1,1,32000], dtype=torch.float32, device="hpu")
+        else:
+            if self.prev_logits is None:
+                self.prev_logits = torch.zeros([BATCH_BUCKET_SIZE,1,32000], dtype=torch.float32, device="hpu")
+            prev_logits = self.prev_logits
+
         # Check if we need to do any bookkeeping first
         if not prefill:
-            assert batch.prev_logits is not None, "no prefill but missing state prior to recombine"
-            new_prev_logits = batch.prev_logits
+            # assert batch.prev_logits is not None, "no prefill but missing state prior to recombine"
+            # new_prev_logits = batch.prev_logits
             batch = batch.__class__.recombine([batch], self.tokenizer.pad_token_id)
-            batch.prev_logits = new_prev_logits
-            assert batch.prev_logits is not None, "no prefill but missing state post to recombine"
+            # batch.prev_logits = new_prev_logits
+            # assert batch.prev_logits is not None, "no prefill but missing state post to recombine"
 
         scenario = 'PREFILL' if prefill else 'GENERATE'
         dbg_trace(
@@ -814,9 +823,9 @@ class CausalLM(Model):
         else:
             input_ids = batch.input_ids
 
-        if batch.prev_logits is None:
-            assert prefill, "prev state missing but not prefill"
-            batch.prev_logits = torch.zeros([1,1,32000], dtype=torch.float32, device="hpu")
+        # if batch.prev_logits is None:
+        #     assert prefill, "prev state missing but not prefill"
+        #     batch.prev_logits = torch.zeros([1,1,32000], dtype=torch.float32, device="hpu")
 
             # batch.prev_next_token_ids = next_token_ids
             # batch.prev_next_token_logprobs = next_token_logprobs
@@ -838,7 +847,7 @@ class CausalLM(Model):
         # batch.prev_next_token_logprobs = next_token_logprobs
         # batch.prev_logprobs = logprobs
 
-        logits = batch.prev_logits
+        logits = prev_logits
 
         # Results
         generations: List[Generation] = []
@@ -866,7 +875,7 @@ class CausalLM(Model):
         htorch.core.mark_step()
 
         if prefill:
-            batch.prev_logits, past = self.forward(
+            new_logits, past = self.forward(
                 input_ids,
                 attention_mask,
                 batch.position_ids,
@@ -875,7 +884,7 @@ class CausalLM(Model):
                 bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
             )
         else:
-            batch.prev_logits = self.forward(
+            self.prev_logits = self.forward(
                 input_ids,
                 attention_mask,
                 batch.position_ids,
