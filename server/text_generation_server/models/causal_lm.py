@@ -725,10 +725,11 @@ class CausalLM(Model):
     def generate_token(self, batches: List[CausalLMBatch]) -> Tuple[List[Generation], Optional[CausalLMBatch]]:
         # Results
         generations: List[Generation] = []
-        stopped = False
         prev_batches = []
-        req_to_batch = {}
+        requests_to_generate = []
 
+        # In order to pipeline any actions on CPU we perform the operation in 3 main stages:
+        # Stage 1. Collect next token ids of any previously started generations
         for batch_id, batch in enumerate(batches):
             if batch.logits is not None:
                 logits = batch.logits
@@ -746,19 +747,13 @@ class CausalLM(Model):
                 # Select next token
                 input_length = batch.input_length
                 if self.is_optimized_for_gaudi and logits.shape[-2] > 1:
-                    next_token_ids, next_token_logprobs, logprobs = batch.next_token_chooser(
+                    next_token_ids, next_token_logprobs, _ = batch.next_token_chooser(
                         batch.input_ids[:, :token_idx], logits[:, input_length - 1: input_length, :].squeeze(-2)
                     )
                 else:
-                    next_token_ids, next_token_logprobs, logprobs = batch.next_token_chooser(
+                    next_token_ids, next_token_logprobs, _ = batch.next_token_chooser(
                         batch.input_ids[:, :token_idx], logits.squeeze(-2)
                     )
-
-                batch_top_token_ids, batch_top_token_logprobs = batch_top_tokens(
-                    batch.top_n_tokens,
-                    batch.top_n_tokens_tensor,
-                    logprobs,
-                )
 
                 prev_batches.append({
                     'next_token_ids': next_token_ids,
@@ -766,8 +761,11 @@ class CausalLM(Model):
                     })
 
                 for req_idx, req in enumerate(batch.requests):
-                    i = req.idx
-                    req_to_batch[i] = {'batch_id': batch_id, 'req_idx': req_idx}
+                    requests_to_generate.append({'req': req,
+                                                 'prev_req_idx': req.idx,
+                                                 'batch_id': batch_id,
+                                                 'seed': batch.next_token_chooser.seeds[req_idx],
+                                                 'do_sample': batch.next_token_chooser.do_sample[req_idx]})
 
                 htorch.core.mark_step()
 
@@ -800,7 +798,7 @@ class CausalLM(Model):
 
         htorch.core.mark_step()
 
-        # if not stopped:
+        # Stage 2. Prepare new batch for speculative scheduling
         if len(batches) > 1:
             batch = self.batch_type.concatenate(batches, self.tokenizer.pad_token_id)
         else:
@@ -856,110 +854,108 @@ class CausalLM(Model):
 
         htorch.core.mark_step()
 
-        # Prepare generations
+        # Stage 3. Finish and return previous generations
+        stopped = len(requests_to_generate) > 0
         for prev_batch in prev_batches:
             prev_batch['next_token_logprobs'] = prev_batch['next_token_logprobs'].tolist()
             prev_batch['next_token_ids_cpu'] = prev_batch['next_token_ids'].cpu()
         htorch.core.mark_step()
 
-        if len(prev_batches) > 0:
-            for req_idx, req in enumerate(batch.requests):
-                i = req.idx
-                if i not in req_to_batch:
-                    continue
-                prev_batch_id = req_to_batch[i]['batch_id']
-                prev_req_idx = req_to_batch[i]['req_idx']
-                assert len(prev_batches) <= 2
-                next_token_ids_cpu = prev_batches[prev_batch_id]['next_token_ids_cpu']
-                next_token_logprobs = prev_batches[prev_batch_id]['next_token_logprobs']
+        for req_data in requests_to_generate:
+            req = req_data['req']
+            i = req_data['prev_req_idx']
+            prev_batch_id = req_data['batch_id']
+            assert len(prev_batches) > prev_batch_id
+            next_token_ids_cpu = prev_batches[prev_batch_id]['next_token_ids_cpu']
+            next_token_logprobs = prev_batches[prev_batch_id]['next_token_logprobs']
 
-                request = req.data
-                input_length = req.input_length
-                prefix_offset = req.prefix_offset
-                read_offset = req.read_offset
-                do_sample = batch.next_token_chooser.do_sample[req_idx]
-                seed = batch.next_token_chooser.seeds[req_idx]
-                stopping_criteria = req.stopping_criteria
-                all_input_ids = req.all_input_ids
-                next_token_id = next_token_ids_cpu[i]
-                next_token_logprob = next_token_logprobs[i]
+            request = req.data
+            input_length = req.input_length
+            prefix_offset = req.prefix_offset
+            read_offset = req.read_offset
+            do_sample = req_data['do_sample']
+            seed = req_data['seed']
+            stopping_criteria = req.stopping_criteria
+            all_input_ids = req.all_input_ids
+            next_token_id = next_token_ids_cpu[i]
+            next_token_logprob = next_token_logprobs[i]
 
-                # Append next token to all tokens
-                if self.is_optimized_for_gaudi:
-                    all_input_ids[input_length] = next_token_id
-                else:
-                    all_input_ids = torch.cat([all_input_ids, next_token_id])
-                new_input_length = input_length + 1
+            # Append next token to all tokens
+            if self.is_optimized_for_gaudi:
+                all_input_ids[input_length] = next_token_id
+            else:
+                all_input_ids = torch.cat([all_input_ids, next_token_id])
+            new_input_length = input_length + 1
 
-                # Generated token
-                next_token_text, prefix_offset, read_offset = self.decode_token(
-                    all_input_ids[0:new_input_length, 0], prefix_offset, read_offset
-                )
+            # Generated token
+            next_token_text, prefix_offset, read_offset = self.decode_token(
+                all_input_ids[0:new_input_length, 0], prefix_offset, read_offset
+            )
 
-                # Evaluate stopping criteria
-                stop, reason = stopping_criteria(
-                    next_token_id,
-                    next_token_text,
-                )
+            # Evaluate stopping criteria
+            stop, reason = stopping_criteria(
+                next_token_id,
+                next_token_text,
+            )
 
-                if not stop:
-                    stopped = False
+            if not stop:
+                stopped = False
 
-                # Shard generations
-                # All generations will be appended in the rust sharded client
-                if i % self.world_size == self.rank:
-                    if stop:
-                        # Decode generated tokens
-                        output_text = self.decode(
-                            all_input_ids[new_input_length - stopping_criteria.current_tokens: new_input_length, 0]
-                        )
-                        generated_text = GeneratedText(
-                            output_text,
-                            stopping_criteria.current_tokens,
-                            reason,
-                            seed if do_sample else None,
-                        )
-                    else:
-                        generated_text = None
-
-                    # Prefill
-                    if stopping_criteria.current_tokens == 1 and request.prefill_logprobs:
-                        # Remove generated token to only have prefill and add nan for first prompt token
-                        prefill_logprobs = [float("nan")] + next_token_logprobs
-                        prefill_token_ids = all_input_ids[0: new_input_length - 1]
-                        prefill_texts = self.tokenizer.batch_decode(
-                            prefill_token_ids,
-                            clean_up_tokenization_spaces=False,
-                            skip_special_tokens=False,
-                        )
-                        prefill_tokens = PrefillTokens(prefill_token_ids, prefill_logprobs, prefill_texts)
-                    else:
-                        prefill_tokens = None
-
-                    top_tokens = None
-
-                    generation = Generation(
-                        request.id,
-                        prefill_tokens,
-                        next_token_id,
-                        next_token_logprob,
-                        next_token_text,
-                        next_token_id in self.all_special_ids,
-                        generated_text,
-                        top_tokens,
+            # Shard generations
+            # All generations will be appended in the rust sharded client
+            if i % self.world_size == self.rank:
+                if stop:
+                    # Decode generated tokens
+                    output_text = self.decode(
+                        all_input_ids[new_input_length - stopping_criteria.current_tokens: new_input_length, 0]
                     )
+                    generated_text = GeneratedText(
+                        output_text,
+                        stopping_criteria.current_tokens,
+                        reason,
+                        seed if do_sample else None,
+                    )
+                else:
+                    generated_text = None
 
-                    generations.append(generation)
+                # Prefill
+                if stopping_criteria.current_tokens == 1 and request.prefill_logprobs:
+                    # Remove generated token to only have prefill and add nan for first prompt token
+                    prefill_logprobs = [float("nan")] + next_token_logprobs
+                    prefill_token_ids = all_input_ids[0: new_input_length - 1]
+                    prefill_texts = self.tokenizer.batch_decode(
+                        prefill_token_ids,
+                        clean_up_tokenization_spaces=False,
+                        skip_special_tokens=False,
+                    )
+                    prefill_tokens = PrefillTokens(prefill_token_ids, prefill_logprobs, prefill_texts)
+                else:
+                    prefill_tokens = None
 
-                req.all_input_ids = all_input_ids
-                req.input_length = new_input_length
-                req.prefix_offset = prefix_offset
-                req.read_offset = read_offset
-                htorch.core.mark_step()
+                top_tokens = None
 
-            self.step = self.step + 1
-            if self.hb_profer_started == True and self.step > self.profiling_warmup_steps + self.profiling_steps:
-                self.hb_profer.stop()
-                self.hb_profer_started = False
+                generation = Generation(
+                    request.id,
+                    prefill_tokens,
+                    next_token_id,
+                    next_token_logprob,
+                    next_token_text,
+                    next_token_id in self.all_special_ids,
+                    generated_text,
+                    top_tokens,
+                )
+
+                generations.append(generation)
+
+            req.all_input_ids = all_input_ids
+            req.input_length = new_input_length
+            req.prefix_offset = prefix_offset
+            req.read_offset = read_offset
+            htorch.core.mark_step()
+
+        self.step = self.step + 1
+        if self.hb_profer_started == True and self.step > self.profiling_warmup_steps + self.profiling_steps:
+            self.hb_profer.stop()
+            self.hb_profer_started = False
 
         return generations, batch if not stopped else None
