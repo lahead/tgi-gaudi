@@ -954,8 +954,11 @@ class CausalLM(Model):
             htorch.core.mark_step()
 
         self.step = self.step + 1
-        if self.hb_profer_started == True and self.step > self.profiling_warmup_steps + self.profiling_steps:
-            self.hb_profer.stop()
-            self.hb_profer_started = False
+        if self.hb_profer_started == True:
+            if self.step > self.profiling_warmup_steps + self.profiling_steps:
+                self.hb_profer.stop()
+                self.hb_profer_started = False
+            else:
+                self.hb_profer.step()
 
         return generations, batch if not stopped else None
