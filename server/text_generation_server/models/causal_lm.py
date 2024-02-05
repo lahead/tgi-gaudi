@@ -523,7 +523,7 @@ class HabanaProfile(object):
         else:
             HabanaProfile.HABANA_PROFILE_ENABLED = False
             schedule = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1)
-            activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]
+            activities = [torch.profiler.ProfilerActivity.HPU]
 
             profiler = torch.profiler.profile(
                 schedule=schedule,
