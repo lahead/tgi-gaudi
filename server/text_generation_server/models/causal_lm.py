@@ -523,12 +523,12 @@ class HabanaProfile(object):
         else:
             HabanaProfile.HABANA_PROFILE_ENABLED = False
             schedule = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1)
-            activities = [torch.profiler.ProfilerActivity.HPU]
+            activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]
 
             profiler = torch.profiler.profile(
                 schedule=schedule,
                 activities=activities,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir, use_gzip=True),
                 record_shapes=record_shapes,
                 with_stack=False,
             )
@@ -698,18 +698,18 @@ class CausalLM(Model):
         )
         prof_ranks = [int(val) for val in os.getenv("PROF_RANKS", "0").split(',')]
         self.profiling_warmup_steps = int(os.getenv("PROF_WARMUPSTEP", "0")) if rank in prof_ranks else 0
-        self.profiling_steps = int(os.getenv("PROF_STEP", "5"))
+        self.profiling_steps = int(os.getenv("PROF_STEP", "0")) if rank in prof_ranks else 0
         record_shapes = os.getenv("PROF_RECORD_SHAPES", "false").lower() == "true"
         output_dir = os.getenv("PROF_PATH", "/tmp/hpu_profile")
-        self.hb_profer = HabanaProfile(
-            warmup=self.profiling_warmup_steps, active=self.profiling_steps, output_dir=output_dir, record_shapes=record_shapes
-        )
-        if self.profiling_warmup_steps > 0:
-            self.hb_profer_started = True
-            self.hb_profer.start()
-        else:
+        if self.profiling_steps <= 0:
             self.hb_profer = None
-            self.hb_profer_started = False
+        else:
+            self.hb_profer = HabanaProfile(
+                warmup=self.profiling_warmup_steps, active=self.profiling_steps, output_dir=output_dir, record_shapes=record_shapes
+            )
+            # self.hb_profer_started = True
+            # self.hb_profer.start()
+        self.hb_profer_started = False
         self.step = 0
 
     def setup_quantization(self, model):
@@ -795,6 +795,9 @@ class CausalLM(Model):
 
     @tracer.start_as_current_span("generate_token")
     def generate_token(self, batches: List[CausalLMBatch]) -> Tuple[List[Generation], Optional[CausalLMBatch]]:
+        if self.hb_profer is not None and self.hb_profer_started == False and self.step < self.profiling_warmup_steps + self.profiling_steps:
+            self.hb_profer_started = True
+            self.hb_profer.start()
         # Results
         generations: List[Generation] = []
         prev_batches = []
@@ -924,6 +927,7 @@ class CausalLM(Model):
                 bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
             )
 
+
         htorch.core.mark_step()
 
         # Stage 3. Finish and return previous generations
@@ -931,6 +935,15 @@ class CausalLM(Model):
         for prev_batch in prev_batches:
             prev_batch['next_token_logprobs'] = prev_batch['next_token_logprobs'].tolist()
             prev_batch['next_token_ids_cpu'] = prev_batch['next_token_ids'].cpu()
+
+        self.step = self.step + 1
+        if self.hb_profer_started == True:
+            if self.step > self.profiling_warmup_steps + self.profiling_steps:
+                self.hb_profer.stop()
+                self.hb_profer_started = False
+            else:
+                self.hb_profer.step()
+
         htorch.core.mark_step()
 
         for req_data in requests_to_generate:
@@ -1024,13 +1037,5 @@ class CausalLM(Model):
             req.prefix_offset = prefix_offset
             req.read_offset = read_offset
             htorch.core.mark_step()
-
-        self.step = self.step + 1
-        if self.hb_profer_started == True:
-            if self.step > self.profiling_warmup_steps + self.profiling_steps:
-                self.hb_profer.stop()
-                self.hb_profer_started = False
-            else:
-                self.hb_profer.step()
 
         return generations, batch if not stopped else None
